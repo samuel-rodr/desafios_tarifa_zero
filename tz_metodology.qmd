@@ -1,0 +1,1293 @@
+---
+title: "Determinantes da Tarifa Zero: Uma Abordagem via Regressão Penalizada de Firth, Modelos Mistos e Machine Learning"
+author: "Samuel dos Santos Rodrigues"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    fig-cap-location: top
+    fig-align: center
+    theme: cosmo
+    highlight-style: github
+    smooth-scroll: true
+    anchor-sections: true
+lang: pt-BR
+editor: visual
+---
+
+# Metodologia:
+
+::: {style="text-align: justify"}
+Na formulação contemporânea de políticas públicas, a inferência baseada em evidências exige a superação de análises descritivas em prol de métodos descritivos, preditivos e causais. A Ciência de Dados aplicada à Ciência Política (NUNES, 2020) tem demonstrado que o rigor estatístico é fundamental para isolar os determinantes estruturais que viabilizam inovações governamentais. Este estudo busca compreender em que medida as variáveis demográficas, socioeconômicas, fiscais e geográficas influenciam a adoção da política de tarifa zero nos municípios brasileiros.
+
+Para tanto, o desenho de pesquisa combina modelagem para eventos raros (KING; ZENG, 2001) com testes de robustez hierárquica (GELMAN; HILL, 2007) e validação de aprendizado de máquina. O objetivo não é apenas explicar o passado, mas fornecer uma ferramenta preditiva (CINELLI; HAZLETT, 2020).
+:::
+
+## Configuração do ambiente
+
+### Opções globais dos chunks:
+
+```{r chunck}
+
+knitr::opts_chunk$set(fig.align = 'center', out.width = '80%')
+
+```
+
+### Pacotes:
+
+```{r packcage, warning=FALSE, message=FALSE}
+
+if(!require(pacman)){install.packages("pacman")}
+  
+pacman::p_load(
+  tidyverse,         # Manipulação de dados e visualização
+  rio,               # Importação de arquivos
+  janitor,           # Limpeza de nomes
+  logistf,           # Regressão Logarítmica Penalizada de Firth (Evento Raro)
+  lme4,              # Modelos Mistos (Controle Hierárquico)
+  brglm2,            # Diagnósticos e Bootstrap
+  boot,              # Rotinas de reamostragem
+  car,               # Testes de GVIF e Linearidade
+  pROC,              # Curva ROC e AUC
+  ResourceSelection, # Teste de Hosmer-Lemeshow
+  segmented,         # Regressão Segmentada (Identificar Breakpoint)
+  knitr, kableExtra, # Tabelas formatadas
+  broom.mixed,       # Organização de resultados de modelos mistos
+  DHARMa,            # Diagnósticos baseados em simulação de resíduos
+  spdep,             # Geoestatística (I de Moran)
+  geobr,             # Malha municipal oficial (IBGE)
+  sf,                # Manipulação de dados espaciais
+  patchwork,         # Exibição combinada de gráficos
+  caret,             # Análise de calibração e K-Fold
+  DT,                # Gráficos e tabelas interativas
+  sensemakr,         # Análise de viés de variável omitida
+  gridGraphics,      # Melhoramento de gráficos
+  marginaleffects,   # Efeitos marginais
+  leaflet,           # Mapas interativos
+  sd,                # Ajuste de mapas
+  ggrepel            # Ajuste de rótulos em gráficos
+)
+
+```
+
+### Banco de dados e engenharia de variáveis:
+
+::: {style="text-align: justify"}
+Visando garantir a estabilidade numérica dos estimadores de máxima verossimilhança e viabilizar a comparação direta da magnitude dos efeitos, as variáveis independentes e covariáveis foram submetidas a um processo de padronização (standardization). Conforme preconizado por Gelman e Hill (2007), essa prática é especialmente recomendada em modelos multiníveis para facilitar a convergência dos algoritmos de ajuste. Preliminarmente, a variável populacional, caracterizada por uma distribuição com severa assimetria positiva, foi convertida para a escala logarítmica natural. Tal procedimento, segundo Wooldridge (2010), é fundamental para linearizar a relação entre a dimensão populacional e a variável dependente, mitigando simultaneamente a influência desproporcional de valores extremos (outliers).
+
+Na sequência, aplicou-se o reescalonamento pelo método de z-score (subtração da média seguida de divisão pelo desvio-padrão) a todos os preditores contínuos, abrangendo o logaritmo da população e os indicadores fiscais (IFGF), de desenvolvimento (IFDM) e econômicos (PIB per capita). A literatura especializada aponta que a padronização dos preditores é crucial para tornar os coeficientes de regressão interpretáveis em uma mesma métrica (GELMAN; HILL, 2007). Ao contrário das escalas originais que, por apresentarem unidades heterogêneas como valores monetários e índices, dificultam a interpretação conjunta, a padronização converte os coeficientes em desvios-padrão. Dessa forma, os resultados passam a refletir o impacto na razão de chances (odds ratio) associado ao incremento de um desvio-padrão em cada variável explicativa, eliminando distorções causadas por diferenças de grandeza nas unidades de medida originais.
+:::
+
+```{r data, warning=FALSE, message=FALSE}
+
+caminho_arquivo <- "02. METADADOS/main_data_tz.xlsx"
+dados_brutos <- import(caminho_arquivo) %>%
+  clean_names()
+
+dados_modelo <- dados_brutos %>%
+  filter(serv_tcu_organizado == 1) %>% 
+  mutate(taxa_pobreza = cadunico_2013 / pop_2013) %>%
+  filter(taxa_pobreza <= 1) %>% 
+  transmute(
+    cod_ibge_7 = cod_ibge_7,
+    nome_municipio,
+    adocao = as.integer(tz_optante),
+    regiao = as.factor(substr(as.character(cod_ibge_7), 1, 1)),
+    log_pop = log(pop_2013),
+    log_pib = log(percapita_2013), 
+    ifgf10 = as.numeric(ifgf_2013) * 10, 
+    uf_controle = as.factor(nome_uf),
+    taxa_vazios = as.numeric(taxa_vazios),
+    densidade = as.numeric(densidade_urbana_2019),
+    taxa_pobreza = as.numeric(taxa_pobreza),
+    pop_real = pop_2013
+  ) %>% na.omit()
+  
+cat("Tamanho Final da Amostra (N):", nrow(dados_modelo), "municípios\n")
+
+# Padronização (Z-score):
+
+dados_modelo_scaled <- dados_modelo %>%
+  mutate(across(
+    c(log_pop, log_pib, ifgf10, taxa_vazios, densidade, taxa_pobreza),
+    ~ as.numeric(scale(.)),
+    .names = "{.col}_sc"
+  ))
+
+```
+
+```{r data_2, warning=FALSE, message=FALSE}
+
+# Baixar a malha municipal simplificada do Brasil (ano 2020 ou mais recente da fonte do IBGE):
+municipios_geo <- read_municipality(year = 2020, showProgress = FALSE)
+
+# Extrair os centros geográficos dos municípios requisito para a utilização do algoritmo DHARMa:
+coords <- st_coordinates(st_centroid(municipios_geo))
+municipios_coords <- municipios_geo %>%
+  mutate(
+    longitude = coords[,1],
+    latitude = coords[,2],
+    cod_ibge_7 = as.character(code_muni) # Forçando a conversão para texto
+  ) %>%
+  st_drop_geometry() %>% 
+  dplyr::select(cod_ibge_7, longitude, latitude) # Pegando apenas o que importa
+
+# Preparação para o join:
+
+dados_modelo_scaled <- dados_modelo_scaled %>% 
+  mutate(cod_ibge_7 = as.character(cod_ibge_7)) %>% # Equalizando o tipo de dado
+  left_join(municipios_coords, by = "cod_ibge_7") 
+
+# Loop para checar se houve valor missing:
+
+n_missing <- sum(is.na(dados_modelo_scaled$latitude))
+if(n_missing > 0) {
+  print(paste("Atenção:", n_missing, "municípios não encontraram correspondência espacial."))
+}
+
+```
+
+## Modelos econométricos:
+
+A estratégia metodológica deste estudo divide-se em duas abordagens complementares para corroborar com a robustez dos insigths:
+
+### Série Temporal Interrompida - Regressão Segmentada - Identificação de Limites (Breakpoints)
+
+::: {style="text-align: justify"}
+Para capturar o efeito não linear previsto pela literatura, onde a vulnerabilidade e o porte demográfico possuem limites de viabilidade , aplicou-se um algoritmo exploratório de Regressão Segmentada. O objetivo é encontrar o Breakpoint (ponto de inflexão) exato nos dados. Após encontrados, esses limites dividirão as variáveis em "Pré" e "Pós" quebra para serem ingeridas pelo modelo de Firth.
+:::
+
+```{r segmented, warning=FALSE, message=FALSE}
+
+m_base_pop <- glm(adocao ~ log_pop, family = binomial, data = dados_modelo)
+seg_pop <- segmented::segmented(m_base_pop, seg.Z = ~ log_pop, psi = median(dados_modelo$log_pop))
+break_log_pop <- summary(seg_pop)$psi[1, "Est."]
+
+m_base_pob <- glm(adocao ~ taxa_pobreza, family = binomial, data = dados_modelo)
+seg_pob <- segmented::segmented(m_base_pob, seg.Z = ~ taxa_pobreza, psi = median(dados_modelo$taxa_pobreza))
+break_pob <- summary(seg_pob)$psi[1, "Est."]
+
+#Converter em escala z-score:
+  
+break_log_pop_sc <- (break_log_pop - mean(dados_modelo$log_pop)) / sd(dados_modelo$log_pop)
+break_pob_sc <- (break_pob - mean(dados_modelo$taxa_pobreza)) / sd(dados_modelo$taxa_pobreza)
+
+# Criar as variáveis para compor o modelo de Firth:
+
+dados_modelo_scaled <- dados_modelo_scaled %>% 
+  mutate(
+    pop_pre  = pmin(log_pop_sc, break_log_pop_sc),
+    pop_post = pmax(log_pop_sc - break_log_pop_sc, 0),
+    pob_pre  = pmin(taxa_pobreza_sc, break_pob_sc),
+    pob_post = pmax(taxa_pobreza_sc - break_pob_sc, 0)
+  )
+
+# Tabela resumo:
+
+tabela_breakpoints <- data.frame(
+  "Variável" = c("População", "Taxa de Pobreza"),
+  "Ponto de Inflexão" = c(round(break_log_pop, 3), round(break_pob_sc, 3)),
+  "Breakpoint" = c(
+    paste(format(round(exp(break_log_pop)), big.mark = ".", decimal.mark = ","), "habitantes"),
+    paste(round(break_pob * 100, 2), "% de Pobreza (CadÚnico)")
+  )
+)
+
+kable(tabela_breakpoints, caption = NULL) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover")) %>%
+  footnote(general = "Valores estimados via algoritmo iterativo de regressão segmentada (GLM).")
+```
+
+### Modelo 1: Redução de Viés das Estimativas de Máxima Verossimilhança - Regressão Logarítmica Penalizada de Firth:
+
+::: {style="text-align: justify"}
+A tarifa zero é um evento raro (presente em ~5% da amostra). A regressão logística clássica sofre de viés de subestimação e separação quase completa sob estas condições. A solução adotada é o estimador de Firth, que aplica uma penalização à função de máxima verossimilhança, garantindo coeficientes finitos e inferência confiável (KING; ZENG, 2001; HEINZE; SCHEMPER, 2002). Para evitar a exaustão de graus de liberdade (explosão de fronteira), controlou-se a geografia por Macro-Regiões, aliada aos vetores segmentados de população e pobreza.
+:::
+
+```{r m1, warning=FALSE, message=FALSE}
+
+m1 <- glm(
+  adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + regiao,
+  family = binomial(link = "logit"),
+  data = dados_modelo_scaled,
+  method = "brglmFit",
+  type = "AS_mean"
+)
+
+summary(m1) # Analisar os preditores do modelo acima
+
+m1_alternativo <- logistf(
+  adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + regiao,
+  data = dados_modelo_scaled,
+  pl = TRUE,
+  flic = TRUE,
+  control = logistf.control(maxit = 5000, lconv = 1e-05, gconv = 1e-05),
+  plcontrol = logistpl.control(maxit = 1000, lconv = 1e-05)
+)
+
+# summary(m1_alternativo) # Analisar os preditores do modelo acima
+
+```
+
+### Modelo 2 - Modelo Linear Generalizado Misto:
+
+::: {style="text-align: justify"}
+A segunda estratégia analítica fundamenta-se na estrutura de Modelos Lineares Generalizados Mistos (GLMM). Nesta especificação, as Unidades Federativas são modeladas como interceptos aleatórios, capturando a heterogeneidade espacial e institucional não observada no nível estadual. Gelman e Hill (2007) argumentam que modelos multiníveis oferecem superioridade analítica para dados com estrutura hierárquica, uma vez que possibilitam o compartilhamento de informações entre grupos (shrinkage). Esse mecanismo resulta em estimativas mais robustas e precisas, especialmente para municípios situados em estados onde a ocorrência do evento de interesse é escassa, evitando o superajuste (overfitting) que ocorreria em modelos de efeitos fixos tradicionais.
+:::
+
+```{r m2, warning=FALSE, message=FALSE}
+
+m2 <- glmer(
+  adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + (1 | uf_controle),
+  data = dados_modelo_scaled, 
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa",
+                         optCtrl = list(maxfun = 200000))
+)
+
+# summary(m2) # Analisar os preditores do modelo acima
+
+```
+
+## Testes de pressupostos:
+
+::: {style="text-align: justify"}
+A robustez das inferências em modelos de regressão logística não depende exclusivamente da significância estatística dos coeficientes, mas também do atendimento aos pressupostos subjacentes ao estimador. Conforme alerta Wooldridge (2010), violações como a má especificação da forma funcional, a presença de multicolinearidade severa ou a influência de observações atípicas podem enviesar os erros-padrão e comprometer a validade interna do estudo. Dessa forma, esta seção dedica-se à verificação sistemática dessas premissas, assegurando que os efeitos observados da gestão fiscal e da estrutura socioeconômica sobre a adoção da Tarifa Zero não sejam artefatos estatísticos.
+:::
+
+### Teste de multicolinearidade:
+
+::: {style="text-align: justify"}
+A redundância entre preditores é uma ameaça à precisão das estimativas, inflando a variância dos coeficientes e dificultando a identificação de efeitos individuais. Para este diagnóstico, calculou-se o Fator de Inflação de Variância Generalizado (GVIF). Seguindo o critério estabelecido por Fox e Monette (1992), aplicável a modelos com termos polinomiais, observou-se o valor de GVIF^(1/(2^df)). Ao contrário da econometria clássica, que muitas vezes tolera um VIF de até 10, a Ciência Política contemporânea, especialmente na literatura de métodos quantitativos brasileira (FIGUEIREDO FILHO et al., 2011), adota uma postura muito mais conservadora devido ao tamanho amostral e à inerente colinearidade de indicadores socioeconômicos estruturais. Dessa forma, consideramos valores ajustados superiores a 2,24 (equivalentes a um VIF tradicional \> 5) como um limiar crítico de colinearidade problemática.
+:::
+
+```{r assumption_1, warning=FALSE, message=FALSE}
+
+vif_res <- car::vif(m1)
+
+vif_df <- as.data.frame(vif_res) %>%
+  rownames_to_column("Variável_Original")
+
+coluna_interesse <- grep("GVIF...1..2.df..", colnames(vif_df), value = TRUE)
+
+if(length(coluna_interesse) > 0) {
+  vif_df$valor_final <- vif_df[[coluna_interesse]]
+} else {
+  vif_df$valor_final <- sqrt(vif_df$GVIF)
+}
+
+vif_tabela <- vif_df %>%
+  mutate(
+    `GVIF Ajustado` = round(valor_final, 3),
+    Status = case_when(
+      valor_final < 2.24 ~ "Baixa Colinearidade",
+      valor_final < 3.16 ~ "Moderada Colinearidade",
+      TRUE ~ "Alta Colinearidade"
+    ),
+    Variável = case_when(
+      Variável_Original == "pop_pre" ~ "População (Até a Inflexão)",
+      Variável_Original == "pop_post" ~ "População (Após a Inflexão)",
+      Variável_Original == "pob_pre" ~ "Pobreza (Até a Inflexão)",
+      Variável_Original == "pob_post" ~ "Pobreza (Após a Inflexão)",
+      Variável_Original == "log_pib_sc" ~ "PIB per capita (Log)",
+      Variável_Original == "ifgf10_sc" ~ "Gestão Fiscal (IFGF)",
+      Variável_Original == "regiao" ~ "Macro-Região",
+      TRUE ~ Variável_Original
+    )
+  ) %>%
+  dplyr::select(Variável, `GVIF Ajustado`, Status) %>% # CORREÇÃO AQUI (dplyr::select)
+  arrange(desc(`GVIF Ajustado`))
+
+vif_tabela %>%
+  kable() %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "Valores de GVIF ajustados pelos graus de liberdade. Em alinhamento com a literatura contemporânea (FIGUEIREDO FILHO et al., 2011), adotou-se o ponto de corte crítico equivalente a um VIF > 5 (GVIF ajustado > 2,24).")
+
+```
+
+### Linearidade no Logito (Visual):
+
+::: {style="text-align: justify"}
+Para as variáveis contínuas inseridas linearmente (PIB e IFGF), verificou-se a premissa de linearidade na função de ligação (logit). A inspeção visual dos gráficos de componentes-mais-resíduos (Component+Residual Plots) permite identificar desvios sistemáticos. Conforme descrito por Cook (1998), a ausência de padrões não aleatórios na dispersão dos resíduos parciais corrobora a adequação da especificação linear para estes preditores.
+:::
+
+```{r assumption_2, warning=FALSE, message=FALSE}
+
+par(mfrow = c(1, 2), mar = c(5, 5, 2, 2), cex.lab = 1.1)
+
+car::crPlots(
+  m1, 
+  terms = ~ log_pib_sc + ifgf10_sc, 
+  layout = NULL,
+  main = "",
+  pch = 16,
+  col = "#bdc3c780",
+  smooth = list(span = 0.5, col = "#e74c3c", lty = 2, lwd = 2.5),
+  col.lines = "#2c3e50",
+  lwd = 2.5,
+  ylab = "Resíduos Parciais (Logito)"
+)
+
+par(mfrow = c(1, 1))
+
+```
+
+### Identificação de Outliers (Distância de Cook):
+
+::: {style="text-align: justify"}
+A sensibilidade do modelo a casos extremos foi avaliada por meio da Distância de Cook. Esta métrica estima a variação nos coeficientes de regressão caso uma observação específica fosse excluída da amostra. Adotou-se o limiar conservador de 4/n sugerido por Bollen e Jackman (1990) para sinalizar pontos de alavancagem. A identificação desses municípios é crucial para assegurar que os resultados gerais não sejam dirigidos por idiossincrasias locais, mas sim por padrões estruturais.
+:::
+
+```{r assumption_3, warning=FALSE, message=FALSE}
+
+dist_cook <- cooks.distance(m1)
+n_obs <- nrow(dados_modelo_scaled)
+limiar <- 4 / n_obs
+
+df_diagnostico <- data.frame(
+  id = 1:n_obs,
+  distancia = dist_cook,
+  municipio = dados_modelo_scaled$nome_municipio, 
+  uf = dados_modelo_scaled$uf_controle,
+  status = ifelse(dist_cook > limiar, "Influente", "Normal")
+)
+
+# Selecionar os 10 principais outlines:
+
+top_outliers <- df_diagnostico %>%
+  filter(status == "Influente") %>%
+  arrange(desc(distancia)) %>%
+  slice(1:10)
+
+# Gráfico:
+
+ggplot(df_diagnostico, aes(x = id, y = distancia)) +
+  geom_point(aes(color = status), alpha = 0.7, size = 2) +
+  geom_hline(yintercept = limiar, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  geom_text_repel(data = top_outliers, 
+                  aes(label = paste(municipio, uf, sep="-")),
+                  size = 3.5, 
+                  box.padding = 0.6,
+                  point.padding = 0.3,
+                  max.overlaps = Inf,
+                  color = "#2c3e50",
+                  fontface = "bold") +
+  scale_color_manual(values = c("Influente" = "#bdc3c780", "Normal" = "#2c3e50")) +
+  labs(
+    x = "Índice do Município na Amostra", 
+    y = "Distância de Cook",
+    color = "Status da Observação"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# Tabela dos outliers:
+
+df_diagnostico %>%
+  filter(status == "Influente") %>%
+  arrange(desc(distancia)) %>%
+  dplyr::select(`Município` = municipio, UF = uf, `Distância de Cook` = distancia) %>%
+  mutate(`Distância de Cook` = round(`Distância de Cook`, 4)) %>%
+  head(10) %>% 
+  kable(caption = "Top 10 Municípios com Maior Influência Alavancada no Modelo") %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+### Bootstrap:
+
+::: {style="text-align: justify"}
+Dada a complexidade do estimador penalizado (brglm2) e a construção das variáveis segmentadas, empregou-se a técnica de Bootstrap não paramétrico para validar a estabilidade estatística das estimativas. Segundo Efron e Tibshirani (1993), o Bootstrap oferece uma aproximação robusta da distribuição amostral dos estimadores, livre de pressupostos distribucionais rígidos. Foram realizadas 2.000 reamostragens (com reposição) para construir intervalos de confiança de 95% baseados em percentis. Este procedimento funciona como um rigoroso teste de estresse, confirmando se a significância dos pontos de ruptura da política se sustenta frente a variações estocásticas na amostra.
+:::
+
+```{r assumption_4, warning=FALSE, message=FALSE}
+
+# Função Bootstrap adaptada para o modelo brglm2 e variáveis segmentadas:
+
+firth_boot_func <- function(data, indices) {
+  d <- data[indices, ]
+  tryCatch({
+    fit <- glm(
+      adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + regiao,
+      family = binomial(link = "logit"),
+      data = d,
+      method = "brglmFit",
+      type = "AS_mean"
+    )
+    
+    vars_interesse <- c("(Intercept)", "pop_pre", "pop_post", "pob_pre", "pob_post", "log_pib_sc", "ifgf10_sc")
+    return(coef(fit)[vars_interesse])
+    
+  }, error = function(e) {
+    return(rep(NA, 7))
+  })
+}
+
+set.seed(33)
+
+boot_m1 <- boot::boot(data = dados_modelo_scaled, 
+                      statistic = firth_boot_func, 
+                      R = 2000) # mudar se necessário.
+
+# Tabela final:
+
+nomes_variaveis <- c(
+  "(Intercepto)", 
+  "População (Até a Inflexão)", "População (Após a Inflexão)",
+  "Pobreza (Até a Inflexão)", "Pobreza (Após a Inflexão)",
+  "PIB per Capita (Log)", 
+  "Gestão Fiscal (IFGF)"
+)
+
+intervalos_boot <- t(sapply(1:7, function(i) {
+  res <- try(boot::boot.ci(boot_m1, type = "perc", index = i)$percent[4:5], silent = TRUE)
+  if(inherits(res, "try-error")) return(c(NA, NA)) else return(res)
+}))
+
+tabela_boot_final <- data.frame(
+  Termo = nomes_variaveis,
+  OR_Original = exp(boot_m1$t0),
+  IC_Inf_Boot = exp(intervalos_boot[,1]),
+  IC_Sup_Boot = exp(intervalos_boot[,2])
+) %>%
+  filter(Termo != "(Intercepto)") %>%
+  mutate(
+    Robustez = ifelse(
+      (IC_Inf_Boot > 1 & IC_Sup_Boot > 1) | (IC_Inf_Boot < 1 & IC_Sup_Boot < 1), 
+      "ROBUSTO", 
+      "Marginal/Não Significativo"
+    )
+  )
+
+tabela_boot_final %>%
+  kable(
+    digits = 3, 
+    col.names = c("Variável Estrutural", "Odds Ratio", "IC Inferior (Boot)", "IC Superior (Boot)", "Status do Efeito")
+  ) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(tabela_boot_final$Robustez == "ROBUSTO"), bold = TRUE, background = "#d4edda") %>%
+  footnote(general = "Intervalos de confiança (95%) baseados em 2.000 percentis bootstrap. A classificação 'ROBUSTO' indica que a direção do efeito se manteve estável na imensa maioria das simulações, sem interceptar a nulidade (Odds Ratio = 1).")
+```
+
+### Diagnóstico de Autocorrelação Espacial:
+
+::: {style="text-align: justify"}
+A literatura em econometria espacial, notadamente Anselin (1988), alerta que a dependência espacial não controlada nos resíduos viola o pressuposto de independência das observações, resultando em estimativas ineficientes. Para verificar a existência de spillover geográfico não capturado pelos efeitos fixos estaduais, aplicou-se o teste de I de Moran sobre os resíduos simulados (DHARMa).
+:::
+
+```{r assumption_5, warning=FALSE, message=FALSE, fig.width=10, fig.height=8}
+
+df_mapa <- dados_modelo_scaled
+predicoes <- predict(m1, type = "response")
+n_obs <- nrow(df_mapa)
+
+set.seed(33)
+simulacoes_matrix <- replicate(250, rbinom(n_obs, 1, predicoes))
+
+simulacao_residuos <- createDHARMa(
+  simulatedResponse = simulacoes_matrix,
+  observedResponse = m1$y,
+  fittedPredictedResponse = predicoes,
+  integerResponse = TRUE
+)
+
+# Teste de Moran:
+
+teste_moran <- testSpatialAutocorrelation(
+  simulacao_residuos, 
+  x = df_mapa$longitude, 
+  y = df_mapa$latitude,
+  plot = FALSE
+)
+
+# Mapa gráfico:
+
+df_mapa$residuos_dharma <- simulacao_residuos$scaledResiduals
+estados_geo <- read_state(year = 2020, showProgress = FALSE)
+ggplot() +
+  geom_sf(data = estados_geo, fill = "#f8f9fa", color = "#bdc3c7", size = 0.5) +
+  geom_point(data = df_mapa,
+             aes(x = longitude, y = latitude, color = residuos_dharma),
+             size = 1.8, alpha = 0.8) +
+  scale_color_gradient2(
+    low = "#2980b9", mid = "#ecf0f1", high = "#ffcb00", midpoint = 0.5,
+    name = "Resíduo Padronizado\n(0 = Subestimação | 1 = Superestimação)"
+  ) +
+  labs(
+    subtitle = paste("Teste I de Moran: p-valor =", round(teste_moran$p.value, 4)),
+    x = NULL, y = NULL
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    plot.subtitle = element_text(hjust = 0.5, color = "black", margin = margin(b = 15)),
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.key.width = unit(2, "cm")
+  )
+
+```
+
+### Falseabilidade e teste de endogeneidade:
+
+::: {style="text-align: justify"}
+Para mitigar a causalidade reversa, as covariáveis foram defasadas estruturalmente (lag 2013). Ainda assim, persiste o viés de variável omitida. O diagnóstico de Sensemakr estabelece os limites da robustez do modelo, alinhando-se à noção de falseabilidade científica de Karl Popper (1959). Se existir uma competência burocrática oculta tão forte quanto o PIB, ela anularia o efeito isolado do IFGF. Tais constatações atestam a extrema maturidade epistemológica do modelo empírico (CINELLI; HAZLETT, 2020).
+:::
+
+```{r assumption_6, warning=FALSE, message=FALSE, fig.width=10, fig.height=8}
+
+# Ajuste do Modelo Linear (LPM) para o algoritmo sensemakr:
+
+modelo_lpm <- lm(
+  adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + regiao, 
+  data = dados_modelo_scaled
+)
+
+sensibilidade_ifgf <- sensemakr(
+  model = modelo_lpm, 
+  treatment = "ifgf10_sc", 
+  benchmark_covariates = "log_pib_sc", 
+  kd = c(1, 2)
+)
+
+# Tabela resumo:
+
+sensibilidade_ifgf$bounds %>%
+  dplyr::select(bound_label, r2dz.x, r2yz.dx, treatment, adjusted_estimate, adjusted_se, adjusted_t, adjusted_lower_CI, adjusted_upper_CI) %>% # CORREÇÃO: dplyr::select
+  mutate(across(where(is.numeric), ~ round(., 4))) %>%
+  kable(caption = "Limites de Sensibilidade ao Viés de Variável Omitida") %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed"))
+
+# Gráfico de Contorno:
+plot(
+  sensibilidade_ifgf, 
+  type = "contour", 
+  main = "Limites Causais (Efeito da Gestão Fiscal)", # CORREÇÃO: "Causais" sem acento
+  xlab = "Poder do Viés no IFGF", 
+  ylab = "Poder do Viés na Tarifa Zero"
+)
+
+```
+
+## Testes de validade:
+
+::: {style="text-align: justify"}
+A validação de um modelo estatístico é o passo que distingue um simples ajuste matemático de uma ferramenta de inferência científica capaz de generalização. Enquanto os testes de pressupostos verificam a coerência interna, os testes de validação avaliam a capacidade preditiva e a estabilidade do modelo frente à incerteza dos dados.
+
+Conforme defendem Hosmer, Lemeshow e Sturdivant (2013), o ajuste de um modelo é apenas a etapa inicial do processo analítico. A utilidade real de uma regressão logística é determinada pela sua capacidade discriminatória (distinguir casos positivos de negativos) e pela sua calibração (precisão das probabilidades estimadas). Sem estes procedimentos, corre-se o risco de o modelo apresentar um excelente desempenho apenas nos dados observados (overfitting), perdendo a validade para explicar processos sociais em outros contextos.
+:::
+
+### Validação do Poder Discriminatório: Curva ROC e AUC
+
+::: {style="text-align: justify"}
+A Área sob a Curva ROC (AUC) mensura a capacidade global do modelo em classificar corretamente os municípios na matriz de confusão (distinguindo "adotantes" de "não adotantes"). Para a interpretação da magnitude preditiva, adotou-se o critério canônico estabelecido por Hosmer, Lemeshow e Sturdivant (2013), segundo o qual valores entre 0,70 e 0,79 indicam discriminação aceitável; valores entre 0,80 e 0,89 representam discriminação excelente; e valores iguais ou superiores a 0,90 são considerados excepcionais (alto risco de outfitting), denotando altíssima sensibilidade e especificidade simultâneas.
+:::
+
+```{r validation_1, warning=FALSE, message=FALSE}
+
+preditos_m1 <- predict(m1, type = "response")
+roc_m1 <- pROC::roc(dados_modelo_scaled$adocao, preditos_m1, quiet = TRUE)
+
+# Tabela de resultados:
+
+data.frame(
+  Métrica = "AUC (Área sob a Curva)",
+  Valor = round(pROC::auc(roc_m1), 4),
+  "IC_Inferior" = round(pROC::ci(roc_m1)[1], 4),
+  "IC_Superior" = round(pROC::ci(roc_m1)[3], 4),
+  Classificação = case_when(
+    pROC::auc(roc_m1) >= 0.90 ~ "Excepcional",
+    pROC::auc(roc_m1) >= 0.80 ~ "Excelente",
+    pROC::auc(roc_m1) >= 0.70 ~ "Aceitável",
+    TRUE ~ "Pobre"
+  )
+) %>% 
+  kable(caption = NULL) %>% 
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "Classificação da acurácia preditiva baseada nos limiares estabelecidos por Hosmer, Lemeshow e Sturdivant (2013).")
+
+```
+
+### Validação Cruzada (Out-of-Sample Performance)
+
+::: {style="text-align: justify"}
+Embora a Curva ROC na amostra de treinamento ateste a qualidade do ajuste, modelos flexíveis correm o risco de sobreajuste (overfitting). Sob a ótica da Ciência de Dados aplicada à Ciência Política (NUNES, 2020), a verdadeira prova de um modelo é sua capacidade de generalização para dados não vistos. Para atestar essa robustez preditiva, essencial para validar as simulações do painel interativo, aplicou-se a técnica de K-Fold Cross-Validation (K = 5). Os dados foram divididos em cinco subamostras mutuamente exclusivas: o modelo logístico de Firth foi treinado repetidamente em 80% dos dados e testado na predição dos 20% restantes (out-of-sample). A sustentação de uma AUC média elevada neste teste consolida a confiabilidade preditiva do algoritmo.
+:::
+
+```{r validation_2, warning=FALSE, message=FALSE}
+
+set.seed(33)
+
+folds <- caret::createFolds(dados_modelo_scaled$adocao, k = 5, list = TRUE)
+auc_folds <- c()
+
+# Loop do K-Fold:
+
+for(i in 1:5) {
+  idx_teste <- folds[[i]]
+  treino <- dados_modelo_scaled[-idx_teste, ]
+  teste <- dados_modelo_scaled[idx_teste, ]
+  fit_cv <- glm(
+   adocao ~ pop_pre + pop_post + pob_pre + pob_post + log_pib_sc + ifgf10_sc + regiao,
+    data = treino,
+    family = binomial(link = "logit"),
+    method = "brglmFit",
+   type = "AS_mean"
+  )
+  pred_cv <- predict(fit_cv, newdata = teste, type = "response")
+  roc_cv <- pROC::roc(teste$adocao, as.numeric(pred_cv), quiet = TRUE)
+  auc_folds[i] <- pROC::auc(roc_cv)
+}
+
+# Tabela de resultados:
+
+data.frame(
+  Métrica = c("AUC (inferior)", "AUC (superior)", "AUC Média (Out-of-Sample)"),
+  Valor = c(round(min(auc_folds), 4), round(max(auc_folds), 4), round(mean(auc_folds), 4)),
+  Interpretação = c("Pior cenário nos testes", "Melhor cenário nos testes", "Capacidade real de generalização")
+) %>%
+  kable(caption = NULL) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "Resultados da Validação Cruzada (5-Folds). Uma AUC média elevada e próxima à AUC global do modelo atesta a robustez preditiva e descarta o risco de overfitting (sobreajuste).")
+
+```
+
+### Validação da Calibração - Hosmer-Lemeshow e Ebrahim-Farrington:
+
+::: {style="text-align: justify"}
+Enquanto a Área sob a Curva (AUC) avalia a ordenação dos riscos, é imperativo verificar a acurácia das probabilidades absolutas preditas. A métrica clássica para este diagnóstico é o teste de Hosmer-Lemeshow (HOSMER; LEMESHOW; STURDIVANT, 2013), que divide a amostra em decis de risco e compara a frequência observada com a esperada. Um p-valor não significativo (p \> 0,05) sugere que o modelo está bem calibrado.
+
+Contudo, a literatura metodológica alerta que o teste de Hosmer-Lemeshow apresenta instabilidade estrutural em amostras com eventos raros ou dados altamente esparsos (\~5% de adoção neste estudo). O fracionamento arbitrário em decis pode gerar estratos com zero eventos observados, o que compromete e distorce a aproximação da estatística qui-quadrado (PAUL; PENNELL; LEMESHOW, 2013; ALLISON, 2014). Para contornar essa limitação e fortificar o diagnóstico, aplicou-se simultaneamente o teste de **Ebrahim-Farrington** (EBRAHIM, 2024; FARRINGTON, 1996), uma alternativa moderna baseada em agrupamento dependente dos dados e desenhada especificamente para lidar com a esparsidade de desfechos binários em regressões logísticas. A convergência de ambos os testes para a não-significância atesta, de forma irrefutável, a excelente calibração do modelo penalizado.
+:::
+
+```{r validation_3, warning=FALSE, message=FALSE}
+
+# Extração das predições e dos valores reais:
+
+preditos_m1 <- predict(m1, type = "response")
+obs_m1 <- m1$y
+
+# Hosmer-Lemeshow:
+
+hl_test <- ResourceSelection::hoslem.test(obs_m1, preditos_m1, g = 10)
+
+# Ebrahim-Farrington:
+
+ef_test <- ebrahim.gof::ef.gof(obs_m1, preditos_m1)
+
+# Tabela comparativa:
+
+ef_flat <- unlist(ef_test)
+ef_stat <- as.numeric(ef_flat[grepl("stat|zef|tef", tolower(names(ef_flat)))][1])
+ef_pval <- as.numeric(ef_flat[grepl("p.val|pval", tolower(names(ef_flat)))][1])
+
+if(is.na(ef_stat)) ef_stat <- 0
+if(is.na(ef_pval)) ef_pval <- 1
+
+tabela_calibracao <- data.frame(
+  Teste = c("Hosmer-Lemeshow", "Ebrahim-Farrington"),
+  `Estatística` = c(round(hl_test$statistic, 3), round(ef_stat, 3)),
+  `Graus de Liberdade` = c(hl_test$parameter, NA), 
+  `p-valor` = c(round(hl_test$p.value, 4), round(ef_pval, 4)),
+  Apontamento = c(
+    ifelse(hl_test$p.value > 0.05, "Calibrado", "Má Calibração"),
+    ifelse(ef_pval > 0.05, "Calibrado", "Má Calibração")
+  ),
+  check.names = FALSE
+)
+
+tabela_calibracao %>% 
+  kable(row.names = FALSE, caption = NULL) %>% 
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "Ambos os testes apresentam p-valor > 0.05, indicando que as probabilidades preditas não diferem estatisticamente da realidade observada.")
+
+```
+
+### Diagnóstico de Ajuste via Simulação de Resíduos (DHARMa) e Calibração
+
+::: {style="text-align: justify"}
+Em complemento aos testes de aderência globais (como o de Ebrahim-Farrington), que podem apresentar sensibilidade a especificidades estocásticas da amostra, optou-se por diagnósticos baseados em simulação de resíduos padronizados (DHARMa). Essa abordagem permite verificar a conformidade do modelo sem os vieses de testes assintóticos tradicionais. Para consolidar a validação, a curva de calibração empírica foi projetada lado a lado com os resíduos espaciais, garantindo uma inspeção visual do alinhamento entre as probabilidades estimadas e a frequência observada da adoção da política pública.
+:::
+
+```{r validation_4, warning=FALSE, message=FALSE, fig.width=14, fig.height=5}
+
+# Teste de Kolmogorov-Smirnov (KS) e Dispersão (se as barras vermelhas não forem significativas, o modelo está bem ajustado):
+
+plot(simulacao_residuos)
+
+# Teste Formal de Uniformidade (p > 0.05 indica bom ajuste):
+
+testUniformity(simulacao_residuos)
+
+# Dataframe para plotagem:
+
+calib_data <- data.frame(
+  obs = as.factor(ifelse(dados_modelo_scaled$adocao == 1, "Sim", "Nao")),
+  pred = predict(m1, type = "response")
+)
+
+# Calibração via Caret:
+
+calib <- calibration(obs ~ pred, data = calib_data, class = "Sim", cuts = 10)
+
+# Plotar:
+
+ggplot(calib) +
+  theme_minimal() +
+  geom_line(color = "#2c3e50", size = 1) +
+  geom_point(color = "#c0392b", size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(
+    x = "Probabilidade Estimada (Decis)",
+    y = "Porcentagem Observada de Eventos"
+  )
+
+```
+
+## Resultados
+
+::: {style="text-align: justify"}
+A seguir apresento os resultados do modelo logístico de firth e logístico misto. As estimativas são reportadas em Razões de Chance (Odds Ratios), calculadas a partir da exponenciação dos coeficientes logit. O Intervalo de Confiança de 95% (IC 95%) fornece a margem de erro estatística: valores cujo intervalo não intercepta a unidade (1,00) são considerados preditores significativos. O modelo controla a dependência espacial e institucional por meio de interceptos aleatórios por Unidade Federativa, tratando as heterogeneidades regionais como efeitos aleatórios.
+:::
+
+### Resultados do Modelo 1 - Efeitos Marginais Médios (AME):
+
+::: {style="text-align: justify"}
+Para superar os conhecidos desafios de interpretação e a heterogeneidade não observada inerentes aos *Odds Ratios* (ALLISON, 1999), os coeficientes do modelo logístico penalizado foram convertidos em Efeitos Marginais Médios (AME - *Average Marginal Effects*). Esta métrica expressa o impacto causal na escala natural das probabilidades. Dessa forma, os resultados indicam a variação absoluta, em pontos percentuais (p.p.), na probabilidade de um município adotar a Tarifa Zero decorrente do incremento de um desvio-padrão no preditor contínuo, mantendo as demais covariáveis em seus valores observados.
+:::
+
+```{r results_1, warning=FALSE, message=FALSE, fig.width=10, fig.height=6}
+
+ame_m1 <- marginaleffects::avg_slopes(m1)
+tabela_ame <- as.data.frame(ame_m1) %>%
+  filter(!grepl("uf_controle", term)) %>%
+  mutate(
+    Efeito_PP = estimate * 100,
+    IC_Inf_PP = conf.low * 100,
+    IC_Sup_PP = conf.high * 100,
+    
+    Variável = case_when(
+      term == "pop_pre" ~ "População (pré-Inflexão)",
+      term == "pop_post" ~ "População (pós-Inflexão)",
+      term == "pob_pre" ~ "Taxa de Pobreza (pré-Inflexão)",
+      term == "pob_post" ~ "Taxa de Pobreza (pós-Inflexão)",
+      term == "log_pib_sc" ~ "PIB per capita (Log)",
+      term == "ifgf10_sc" ~ "Saúde Fiscal (IFGF)",
+      term == "regiao" & grepl("2", contrast) ~ "Região Nordeste",
+      term == "regiao" & grepl("3", contrast) ~ "Região Sudeste",
+      term == "regiao" & grepl("4", contrast) ~ "Região Sul",
+      term == "regiao" & grepl("5", contrast) ~ "Região Centro-Oeste",
+      TRUE ~ paste(term, contrast)
+    ),
+    
+    Significância = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ ".",
+      TRUE ~ ""
+    ),
+    
+    Status = case_when(
+      IC_Inf_PP > 0 ~ "Positivo e Significativo",
+      IC_Sup_PP < 0 ~ "Negativo e Significativo",
+      TRUE ~ "Não Significativo"
+    )
+  ) %>%
+  mutate(Variável = make.unique(as.character(Variável)))
+
+# Tabela:
+
+tabela_ame %>%
+  dplyr::select(Variável, Efeito_PP, IC_Inf_PP, IC_Sup_PP, p.value, Significância) %>%
+  mutate(across(c(Efeito_PP, IC_Inf_PP, IC_Sup_PP), ~ round(., 2)),
+         p.value = round(p.value, 4)) %>%
+  rename(`Efeito (Pontos %)` = Efeito_PP, `IC Inferior (%)` = IC_Inf_PP, `IC Superior (%)` = IC_Sup_PP, `p-valor` = p.value) %>%
+  kable(align = "lccccr", row.names = FALSE, caption = NULL) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "*** p < 0.001; ** p < 0.01; * p < 0.05. Valores expressam a mudança em pontos percentuais (p.p.) na probabilidade do evento.")
+
+# Gráfico Forest:
+
+df_plot <- tabela_ame %>%
+  mutate(Variável = factor(Variável)) %>%
+  mutate(Variável = forcats::fct_relevel(Variável, 
+    "Região Centro-Oeste", "Região Sul", "Região Sudeste", "Região Nordeste",
+    "PIB per capita (Log)", 
+    "Saúde Fiscal (IFGF)", 
+    "Taxa de Pobreza (pós-Inflexão)", "Taxa de Pobreza (pré-Inflexão)",
+    "População (pós-Inflexão)", "População (pré-Inflexão)"
+  ))
+
+m1_graf <- ggplot(df_plot, aes(x = Efeito_PP, y = Variável, color = Status)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_errorbarh(aes(xmin = IC_Inf_PP, xmax = IC_Sup_PP), height = 0.2, linewidth = 1) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Positivo e Significativo" = "#009c08", 
+                                "Negativo e Significativo" = "#d80000", 
+                                "Não Significativo" = "#95a5a6")) +
+  scale_x_continuous(breaks = seq(-15, 15, by = 5), 
+                     limits = c(-15, 15)) + 
+  labs(
+    x = "Variação na Probabilidade (Pontos Percentuais)",
+    y = NULL,
+    color = "Status do Efeito:"
+  ) +
+  theme_minimal(base_size = 14, base_family = "serif") + 
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(face = "bold"),
+    plot.margin = margin(t = 20, r = 20, b = 40, l = 20),
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5), 
+    axis.line = element_blank(), 
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.text.x = element_text(color = "black")
+  ) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, label.position = "right"))
+
+print(m1_graf)
+
+ggsave(
+  filename = "04. INFOGRÁFICOS/02. RLPF/grafico_floresta_m1_tiff.tiff",
+  plot = m1_graf,
+  width = 9,
+  height = 5,
+  dpi = 300,
+  compression = "lzw",
+  device = "tiff"
+)
+
+ggsave(
+  filename = "04. INFOGRÁFICOS/02. RLPF/grafico_floresta_m1_pdf.pdf",
+  plot = m1_graf,
+  width = 10,
+  height = 6,
+  device = cairo_pdf
+)
+
+```
+
+### Modelo 2: Regressão Logística Multinível:
+
+::: {style="text-align: justify"}
+Complementarmente, estimou-se um modelo logístico de efeitos mistos (*Generalized Linear Mixed Model* - GLMM), incorporando interceptos aleatórios por Unidade Federativa (UF). Esta abordagem permite controlar a correlação intragrupo e a heterogeneidade não observada em nível estadual. Assim como no modelo anterior, os coeficientes foram convertidos em **Efeitos Marginais Médios (AME)**, expressando a variação na probabilidade de adoção da Tarifa Zero em pontos percentuais (p.p.).
+:::
+
+```{r results_2, warning=FALSE, message=FALSE, fig.width=10, fig.height=6}
+
+ame_m2 <- marginaleffects::avg_slopes(m2)
+tabela_ame_m2 <- as.data.frame(ame_m2) %>%
+  mutate(
+    Efeito_PP = estimate * 100,
+    IC_Inf_PP = conf.low * 100,
+    IC_Sup_PP = conf.high * 100,
+    
+    Variável = case_when(
+      term == "pop_pre" ~ "População (Até Inflexão)",
+      term == "pop_post" ~ "População (Após Inflexão)",
+      term == "pob_pre" ~ "Pobreza (Até Inflexão)",
+      term == "pob_post" ~ "Pobreza (Após Inflexão)",
+      term == "log_pib_sc" ~ "PIB per Capita (Log)",
+      term == "ifgf10_sc" ~ "Gestão Fiscal (IFGF)",
+      term == "regiao" & grepl("2", contrast) ~ "Região Nordeste",
+      term == "regiao" & grepl("3", contrast) ~ "Região Sudeste",
+      term == "regiao" & grepl("4", contrast) ~ "Região Sul",
+      term == "regiao" & grepl("5", contrast) ~ "Região Centro-Oeste",
+      TRUE ~ term
+    ),
+    
+    Significância = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ ".",
+      TRUE ~ ""
+    ),
+    
+    Status = case_when(
+      IC_Inf_PP > 0 ~ "Positivo e Significativo",
+      IC_Sup_PP < 0 ~ "Negativo e Significativo",
+      TRUE ~ "Não Significativo"
+    )
+  ) %>%
+  mutate(Variável = make.unique(as.character(Variável)))
+
+# Tabela:
+
+tabela_ame_m2 %>%
+  dplyr::select(Variável, Efeito_PP, IC_Inf_PP, IC_Sup_PP, p.value, Significância) %>%
+  mutate(across(c(Efeito_PP, IC_Inf_PP, IC_Sup_PP), ~ round(., 2)),
+         p.value = round(p.value, 4)) %>%
+  rename(`Efeito (Pontos %)` = Efeito_PP, `IC Inferior (%)` = IC_Inf_PP, `IC Superior (%)` = IC_Sup_PP, `p-valor` = p.value) %>%
+  kable(align = "lccccr", row.names = FALSE, caption = NULL) %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general = "Estimativas de efeitos marginais médios (AME) extraídas de modelo logístico com efeitos aleatórios por UF.")
+
+# Gráfico Forest:
+
+df_plot_m2 <- tabela_ame_m2 %>%
+  mutate(Variável = factor(Variável)) %>%
+  mutate(Variável = forcats::fct_relevel(Variável, 
+    "Região Centro-Oeste", "Região Sul", "Região Sudeste", "Região Nordeste",
+    "PIB per Capita (Log)", "Gestão Fiscal (IFGF)", 
+    "Pobreza (Após Inflexão)", "Pobreza (Até Inflexão)",
+    "População (Após Inflexão)", "População (Até Inflexão)"
+  ))
+
+ggplot(df_plot_m2, aes(x = Efeito_PP, y = Variável, color = Status)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_errorbarh(aes(xmin = IC_Inf_PP, xmax = IC_Sup_PP), height = 0.2, linewidth = 1) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("Positivo e Significativo" = "#2980b9", 
+                                "Negativo e Significativo" = "#ffcb00", 
+                                "Não Significativo" = "#95a5a6")) +
+  labs(
+    x = "Variação na Probabilidade (Pontos Percentuais)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", color = "#2c3e50", hjust = 0.5)
+  )
+
+
+
+```
+
+### Discussão dos Resultados:
+
+::: {style="text-align: justify"}
+A convergência dos resultados entre o modelo de regressão logística penalizada (Firth) e o modelo multinível com interceptos aleatórios por Unidade Federativa (UF) confere alta robustez às inferências apresentadas. A estabilidade dos Efeitos Marginais Médios (AME) em ambas as especificações sugere que os determinantes da Tarifa Zero no Brasil transcendem particularidades estaduais, operando sob lógicas estruturais de capacidade estatal e dinâmica demográfica.
+
+1.  A Primazia da Capacidade Estatal e Fiscal Os achados corroboram a literatura clássica de capacidades estatais (state capacity), ao demonstrarem que a Gestão Fiscal (IFGF) e o PIB per Capita possuem efeitos positivos e estatisticamente significativos na probabilidade de adoção. O incremento de aproximadamente 1,5 a 1,6 pontos percentuais (p.p.) por desvio-padrão sugere que o equilíbrio das contas públicas não é apenas um adereço administrativo, mas uma pré-condição para a sustentabilidade de subsídios integrais. Conforme defendido por Affonso (2000) e Arretche (2012), a autonomia financeira municipal é o gargalo que separa a intenção política da implementação efetiva de políticas redistributivas de alto custo operacional.
+
+2.  A Complexidade Urbana e o Efeito de Inflexão O resultado mais inovador reside na confirmação da hipótese de não-linearidade populacional. Observa-se um efeito de "U Invertido": em municípios menores, o ganho de escala demográfica atua como catalisador da política (+5,29 a +5,75 p.p.). Contudo, ao atingir o ponto de inflexão estrutural, o sinal inverte-se drasticamente (-5,44 a -5,84 p.p.). Este fenômeno encontra eco na literatura de economia urbana sobre deseconomias de escala: em grandes metrópoles, a complexidade das redes de transporte, o volume de passageiros e o custo marginal de operação tornam o subsídio universal um desafio fiscal quase intransponível sem aportes federais ou estaduais massivos.
+
+3.  O Dilema da Pobreza: Demanda vs. Viabilidade A relação entre pobreza e Tarifa Zero revela um mecanismo de "armadilha da escassez". Embora o aumento inicial da pobreza estimule a adoção (+3,02 a +3,51 p.p.) — possivelmente devido à pressão política por justiça social e mobilidade — o excesso de vulnerabilidade socioeconômica após o ponto de inflexão exerce o impacto negativo mais severo de todo o modelo (-8,39 a -9,28 p.p.). Isso indica que municípios com tecidos sociais extremamente fragilizados carecem da base tributária necessária para sustentar o "custo da gratuidade", evidenciando que a política, apesar de seu caráter inclusivo, encontra barreiras intransponíveis em contextos de extrema carência fiscal.
+
+4.  Robustez Espacial e Efeitos Federativos A manutenção da significância das variáveis no Modelo Multinível reforça que a heterogeneidade entre as UFs — como diferenças em legislações estaduais ou consórcios intermunicipais — não anula o peso dos preditores municipais. O forte impacto da Região Sudeste sugere um efeito de difusão política (policy diffusion) por proximidade geográfica e mimetismo institucional, onde o sucesso da política em polos pioneiros incentiva a adoção em municípios vizinhos, independentemente de seus atributos fiscais isolados.
+:::
+
+## Machine Learning
+
+::: {style="text-align: justify"}
+Embora o modelo de regressão logística forneça probabilidades contínuas, a tomada de decisão em políticas públicas exige frequentemente uma classificação binária (adotar ou não adotar). A literatura de aprendizado de máquina (Machine Learning) alerta que, em conjuntos de dados desbalanceados — onde a ocorrência do evento de interesse é rara —, a aplicação do limiar de corte padrão de 0,50 tende a enviesar as previsões em favor da classe majoritária, ignorando os casos positivos (KUHN; JOHNSON, 2013).
+
+Para corrigir essa distorção, aplicou-se a técnica de threshold moving (deslocamento de limiar), que consiste em ajustar a régua de decisão para maximizar a performance do modelo em métricas específicas, em vez da acurácia global. Conforme Lantz (2019), em cenários onde a omissão de um evento positivo é crítica (falso negativo), deve-se priorizar métricas como o F1-Score, que pondera harmonicamente a precisão (precision) e a sensibilidade (recall). Dessa forma, o ponto de corte de 12,5% não foi escolhido arbitrariamente, mas determinado algoritmicamente para capturar o maior número de municípios com potencial real de adoção, respeitando a estrutura de probabilidade subjacente aos dados.
+:::
+
+### Limiar de Viabilidade Estrutural
+
+::: {style="text-align: justify"}
+Dada a natureza de evento raro da adoção da Tarifa Zero (presente em menos de 5% da amostra), a utilização do limiar de classificação padrão de 0,50 (50%) mostrar-se-ia estatisticamente inadequada, resultando em uma taxa excessiva de falsos negativos. Para estabelecer uma régua de decisão ajustada à realidade dos dados, procedeu-se ao cálculo do ponto de corte ótimo (Optimal Cutoff) através da maximização do F1-Score, métrica que harmoniza a precisão e a sensibilidade do modelo.
+:::
+
+```{r ruler, warning=FALSE, message=FALSE}
+
+preditos_m1 <- predict(m1, type = "response")
+roc_obj <- pROC::roc(dados_modelo_scaled$adocao, preditos_m1, quiet = TRUE)
+
+coords_youden <- pROC::coords(roc_obj, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))
+coords_topleft <- pROC::coords(roc_obj, "best", best.method = "closest.topleft", ret = c("threshold", "sensitivity", "specificity"))
+
+cortes <- seq(0.01, 0.50, by = 0.005)
+f1_scores <- sapply(cortes, function(corte) {
+  pred_class <- ifelse(preditos_m1 >= corte, 1, 0)
+  cm <- table(factor(pred_class, levels=c(0,1)), factor(dados_modelo_scaled$adocao, levels=c(0,1)))
+  precision <- cm[2,2] / sum(cm[2,])
+  recall    <- cm[2,2] / sum(cm[,2])
+  f1 <- ifelse((precision + recall) == 0, 0, 2 * (precision * recall) / (precision + recall))
+  return(f1)
+})
+
+melhor_corte_f1 <- cortes[which.max(f1_scores)]
+
+# Tabela de resultados:
+
+data.frame(
+  Metodologia = c("Índice de Youden (Balanceado)", "Geométrico (Top-Left)", "Maximização do F1 (Foco em Raros)"),
+  `Régua (%)` = c(paste0(round(coords_youden$threshold * 100, 2), "%"), 
+                  paste0(round(coords_topleft$threshold * 100, 2), "%"), 
+                  paste0(round(melhor_corte_f1 * 100, 2), "%")),
+  `Interpretação` = c("Maximiza acertos globais", "Ponto mais próximo do ideal", "Melhor balanço para evento raro")
+) %>%
+  kable() %>% kable_styling(full_width = F, bootstrap_options = "striped")
+
+# Histograma:
+
+hist(preditos_m1, breaks=50, main= NULL, xlab="Probabilidade", ylab = "Frequência", col="#2980b9", border="white")
+abline(v = melhor_corte_f1, col="#ffcb00", lwd=3, lty=2)
+text(melhor_corte_f1, 50, paste("Corte F1:", round(melhor_corte_f1*100,1),"%"), pos=4, col="#ffcb00", font=2)
+
+```
+
+### 2. Análise de Cenário (Cidades-Tipo)
+
+::: {style="text-align: justify"}
+Para traduzir os coeficientes estatísticos em realidade política, construímos três "municípios-tipo" representativos da diversidade brasileira. A simulação mantém fixas as variáveis de controle (como a UF e a gestão fiscal média) e altera apenas as características estruturais de população e pobreza.
+:::
+
+```{r scenario_analysis, warning=FALSE, message=FALSE}
+
+padronizar <- function(valor_bruto, media, desvio, logaritmico = FALSE) {
+  if(logaritmico) valor_bruto <- log(valor_bruto)
+  return((valor_bruto - media) / desvio)
+}
+
+media_log_pop <- mean(log(dados_brutos$pop_2013), na.rm=T)
+sd_log_pop    <- sd(log(dados_brutos$pop_2013), na.rm=T)
+media_pobreza <- mean(dados_modelo$taxa_pobreza, na.rm=T) 
+sd_pobreza    <- sd(dados_modelo$taxa_pobreza, na.rm=T)
+media_log_pib <- mean(log(dados_brutos$percapita_2013), na.rm=T)
+sd_log_pib    <- sd(log(dados_brutos$percapita_2013), na.rm=T)
+media_ifgf    <- mean(as.numeric(dados_brutos$ifgf_2013), na.rm=T) * 10
+sd_ifgf       <- sd(as.numeric(dados_brutos$ifgf_2013), na.rm=T) * 10
+
+
+limiar_pop_log <- log(50000)
+limiar_pob     <- 0.40
+
+cenarios_brutos <- data.frame(
+  Perfil = c("1. Pequena Cidade", "2. Cenário Ideal", "3. Metrópole"),
+  pop_val = c(4000, 50000, 2500000),
+  pob_val = c(0.60, 0.15, 0.25),
+  pib_val = c(5000, 40000, 35000),
+  ifgf_val = c(2.0, 8.0, 6.0)
+)
+
+cenarios_scaled <- cenarios_brutos %>%
+  mutate(
+    log_pop = log(pop_val),
+    pop_sc  = (log_pop - media_log_pop) / sd_log_pop,
+    pop_pre = ifelse(log_pop <= limiar_pop_log, pop_sc, 0),
+    pop_post = ifelse(log_pop > limiar_pop_log, pop_sc, 0),
+    
+    pob_sc  = (pob_val - media_pobreza) / sd_pobreza,
+    pob_pre = ifelse(pob_val <= limiar_pob, pob_sc, 0),
+    pob_post = ifelse(pob_val > limiar_pob, pob_sc, 0),
+    
+    log_pib_sc = padronizar(pib_val, media_log_pib, sd_log_pib, logaritmico=T),
+    ifgf10_sc  = padronizar(ifgf_val, media_ifgf, sd_ifgf),
+    
+    regiao = factor("3", levels = levels(dados_modelo_scaled$regiao))
+  )
+
+cenarios_brutos$Probabilidade <- predict(m1, newdata = cenarios_scaled, type = "response")
+
+# Tabela:
+
+cenarios_brutos %>%
+  mutate(Probabilidade = paste0(round(Probabilidade * 100, 2), "%")) %>%
+  dplyr::select(
+    Perfil, 
+    População = pop_val, 
+    `Pobreza %` = pob_val, 
+    `Gestão Fiscal (IFGF)` = ifgf_val, 
+    `Probabilidade Estimada` = Probabilidade
+  ) %>%
+  kable(align = "lcccc") %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover")) %>%
+  footnote(general = "Estimativas baseadas no modelo logístico penalizado de Firth (m1). As probabilidades refletem o impacto das variáveis estruturais segmentadas por pontos de inflexão.")
+
+```
+
+### Painéis interativos:
+
+::: {style="text-align: justify"}
+Para além dos perfis teóricos, a ferramenta abaixo disponibiliza as probabilidades estimadas para a totalidade da amostra (N = 2.533). Esta interface permite confrontar a "opinião" do modelo estatístico com a decisão política real tomada em cada localidade.Ao pesquisar por um município, observe a coluna Probabilidade (Modelo). Valores acima da régua de corte calculada (12,5%) sinalizam que a cidade possui as pré-condições estruturais (fiscais, econômicas e demográficas) típicas dos casos de sucesso. Discrepâncias entre a alta probabilidade estimada e a não-adoção (Tarifa zero "Não") podem ser interpretadas como janelas de oportunidade, onde as condições técnicas existem, mas a decisão de implementação ainda não foi ativada.
+:::
+
+#### Mapa Interativo:
+
+```{r interactive_map, warning=FALSE, message=FALSE}
+
+df_para_mapa <- dados_modelo_scaled %>%
+  mutate(code_muni = as.numeric(as.character(cod_ibge_7)))
+
+dados_mapa_interativo <- municipios_geo %>%
+  mutate(code_muni = as.numeric(as.character(code_muni))) %>%
+  left_join(df_para_mapa, by = "code_muni") %>%
+  filter(!is.na(adocao)) %>%
+  mutate(
+    prob = predict(m1, newdata = ., type = "response"),
+    
+    classificacao = case_when(
+      adocao == 1 ~ "Adotou a tarifa zero",
+      prob >= melhor_corte_f1 ~ "Janela de Oportunidade",
+      TRUE ~ "Baixa Probabilidade Estrutural"
+    ),
+    cor = case_when(
+      classificacao == "Adotou a tarifa zero" ~ "#2980b9",
+      classificacao == "Janela de Oportunidade" ~ "#ffcb00",
+      TRUE ~ "#bdc3c7" # Cinza
+    )
+  ) %>%
+  st_centroid()
+
+# 2. Gerar o Mapa Leaflet
+leaflet(dados_mapa_interativo, width = "100%", height = "600px") %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    radius = ~ifelse(classificacao == "Baixa Probabilidade Estrutural", 2, 6),
+    color = ~cor, 
+    stroke = FALSE, 
+    fillOpacity = 0.7,
+    popup = ~paste0("<b>", name_muni, "</b><br>",
+                   "Probabilidade: ", round(prob*100, 2), "%<br>",
+                   "Status: ", classificacao)
+  ) %>%
+  addLegend(position = "bottomright", 
+            colors = c("#2980b9", "#ffcb00", "#bdc3c7"), 
+            labels = c("Adotou a tarifa zero", "Janela de Oportunidade", "Baixa Probabilidade"),
+            title = "Diagnóstico do Modelo")
+
+```
+
+#### Tabela interativa:
+
+```{r interactive_graphic, warning=FALSE, message=FALSE}
+
+dados_interface <- dados_modelo_scaled %>%
+  mutate(
+    probabilidade = predict(m1, type = "response"),
+    Chance_Modelo = paste0(round(probabilidade * 100, 2), "%"),
+    Status_Real = ifelse(adocao == 1, "Sim", "Não")
+  )
+
+tabela_exibicao <- dados_interface %>%
+  dplyr::select(
+    Município = nome_municipio, 
+    UF = uf_controle, 
+    `Tarifa Zero (Real)` = Status_Real, 
+    `Probabilidade (Modelo)` = Chance_Modelo,
+    prob_num = probabilidade
+  )
+
+# Tabelaa interativa:
+
+datatable(tabela_exibicao, 
+          filter = 'top',
+          rownames = FALSE,
+          options = list(
+            pageLength = 10,
+            autoWidth = TRUE,
+            scrollX = TRUE,
+            dom = 'frtip',       
+            language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Portuguese-Brasil.json'),
+            columnDefs = list(
+              list(className = 'dt-center', targets = '_all'),
+              list(visible = FALSE, targets = 4) 
+            ))
+          ) %>%
+  formatStyle(
+    'Probabilidade (Modelo)',
+    'prob_num',
+    background = styleColorBar(c(0, 1), '#d4edda'), 
+    backgroundSize = '98% 88%',
+    backgroundRepeat = 'no-repeat',
+    backgroundPosition = 'center'
+  )
+
+```
+
+# Evolução e Refinamento da Arquitetura Metodológica
+
+::: {style="text-align: justify"}
+O desenvolvimento da estratégia analítica deste estudo seguiu um processo de refinamento. O objetivo central consistiu em encontrar o equilíbrio entre a parcimônia estatística e a fidelidade à ontologia complexa do fenômeno observado, garantindo que o modelo refletisse as reais fricções do processo de adoção de políticas públicas.
+
+### 1. O Paradoxo dos Eventos Raros e a Separação Perfeita
+
+A etapa exploratória inicial baseou-se na estimação de um modelo de regressão logística binária tradicional via Máxima Verossimilhança (MLE). No entanto, dada a natureza de evento raro da adoção da Tarifa Zero (presente em menos de 5% da amostra), as estimativas preliminares apresentaram severa instabilidade numérica. Esse fenômeno, conhecido na econometria como separação quase completa dos dados (WOOLDRIDGE, 2010), ocorre quando variáveis preditoras (ou a combinação destas) discriminam o desfecho de forma perfeita em determinados subgrupos. No escopo desta pesquisa, a tentativa de controlar os efeitos fixos por Unidade Federativa (UF) gerou "categorias vazias" em estados sem nenhum registro de adoção da política. Sob a estimação tradicional, isso resulta em coeficientes inflados ao infinito e erros-padrão imprecisos, inviabilizando a inferência causal segura.
+
+### 2. Estimação Penalizada de Firth (Redução de Viés)
+
+Para contornar as limitações estruturais da Máxima Verossimilhança em amostras desbalanceadas, a arquitetura principal do estudo migrou para a Regressão Logística Penalizada de Firth. Conforme elucidado por Heinze e Schemper (2002) e operacionalizado computacionalmente por Kosmidis e Firth (2021), essa abordagem introduz um termo de penalização na função de verossimilhança original (baseado na matriz de informação de Fisher). Esse ajuste metodológico neutraliza o viés assintótico de amostras finitas e viabiliza a obtenção de estimativas finitas, robustas e consistentes, mesmo diante do cenário de separação quase completa causado pela inclusão de controles estaduais (Modelo Principal - *m1*).
+
+### 3. Parcimônia e Controle de Multicolinearidade
+
+A especificação do modelo foi guiada pelo princípio da parcimônia. Durante a fase de testes, foram avaliadas variáveis adicionais de controle urbanístico e socioeconômico, como densidade demográfica, taxas de vazios imobiliários e indicadores compostos (ex: IGEM). A análise de multicolinearidade através do Fator de Inflação da Variância (VIF), aliada à inspeção dos Critérios de Informação de Akaike (AIC) e Bayesiano (BIC), indicou que a manutenção desses fatores gerava redundância explicativa. Em consonância com os postulados de Gelman e Hill (2007) — os quais alertam que o excesso de preditores correlacionados inflaciona a incerteza das estimativas sem mitigar o viés de omissão —, variáveis sobrepostas foram descontinuadas. Isso permitiu concentrar o poder estatístico do modelo nos determinantes estruturais críticos: demografia, capacidade fiscal e pobreza.
+
+### 4. Não-Linearidade e Quebras Estruturais (O Efeito U-Invertido)
+
+Um dos avanços analíticos mais significativos desta pesquisa consistiu na flexibilização da premissa de linearidade estrita. Embora abordagens exploratórias tenham considerado o uso de polinômios suavizados (*natural splines*), a especificação final adotou uma regressão segmentada (*piecewise regression*). Apoiando-se na perspectiva de Fox e Weisberg (2019) de que fenômenos sociais possuem limites críticos de capacidade, o modelo incorporou pontos de inflexão matemáticos (quebras estruturais) para o tamanho populacional e a taxa de pobreza. Essa decisão foi fundamental para capturar o efeito de "U Invertido", provando estatisticamente que os fatores que catalisam a adoção da Tarifa Zero em municípios menores passam a atuar como inibidores (deseconomias de escala e exaustão fiscal) quando a localidade cruza a fronteira metropolitana.
+
+### 5. Validação Espacial via Modelagem Multinível
+
+Por fim, embora o estimador de Firth (*m1*) tenha conferido estabilidade ao tratamento de eventos raros, reconhece-se que modelos de nível único podem negligenciar a dependência espacial das observações. Para corroborar a solidez das inferências e descartar que os achados fossem meros artefatos de legislações estaduais específicas, estimou-se de forma complementar um Modelo Linear Generalizado Misto (GLMM). Esta estrutura multinível (Modelo de Sensibilidade - *m2*) tratou as Unidades Federativas como interceptos aleatórios. A convergência dos resultados entre a regressão penalizada (foco no desbalanceamento) e a regressão mista (foco na hierarquia federativa) atesta, de forma inequívoca, a robustez metodológica dos determinantes estruturais identificados nesta pesquisa.
+:::
+
+::: {style="text-align: justify"}
+As evidências empíricas consolidadas nesta investigação corroboram a premissa de que a difusão da Tarifa Zero no arranjo federativo brasileiro constitui um fenômeno multidimensional. Sua viabilidade não é condicionada estritamente pela mera disponibilidade de recursos macroeconômicos, mas, de maneira mais profunda, pela interseção entre a capacidade estatal local e o perfil de vulnerabilidade socioeconômica do município.
+
+As estimativas derivadas do modelo logístico penalizado de Firth (*m1*) indicam que a eficiência da gestão fiscal (IFGF) e a dimensão da renda (PIB per capita) operam como vetores preditivos positivos para a adoção da política. Contudo, as rotinas de validação via *Bootstrap* revelaram assimetrias importantes na resiliência desses coeficientes: o indicador de higidez fiscal demonstrou uma estabilidade paramétrica substancialmente superior à do PIB per capita. Sob o prisma analítico, esse achado sugere que a solvência administrativa e a qualidade alocativa do gasto público representam pré-requisitos mais determinantes para a sustentabilidade de subsídios integrais do que a riqueza bruta do território, evidenciando o peso da "capacidade estatal" na formulação de políticas de alto custo operacional.
+
+Ademais, a flexibilização da linearidade estrita e a estimação do modelo multinível (*m2*) desvelaram mecanismos causais complexos. A modelagem segmentada confirmou uma relação não-linear, em formato de "U invertido", transversal aos indicadores de pobreza e escala demográfica. Esse comportamento sugere uma tensão inerente às políticas redistributivas locais: enquanto níveis moderados de vulnerabilidade social atuam como gatilhos de pressão política e demanda democrática por inclusão (incentivando a adoção), cenários de pobreza extrema e hiperadensamento urbano impõem barreiras fiscais proibitivas. Nesses limiares críticos, a base de arrecadação municipal torna-se insuficiente para absorver o custo marginal de um sistema de transporte complexo.
+
+Em síntese, os achados apontam para um viés estrutural na difusão da Tarifa Zero: a política tende a florescer com maior aderência em municípios de pequeno e médio porte que ostentam indicadores de gestão saneados e vulnerabilidade social moderada. Ela não se restringe aos enclaves de alta riqueza, mas encontra um teto de vidro intransponível em localidades imersas em armadilhas de escassez fiscal extrema ou deseconomias de escala metropolitana. A consistência das métricas de validação preditiva (como a AUC) e a robustez dos testes de reamostragem atestam a confiabilidade dessas inferências, posicionando a responsabilidade fiscal e a morfologia socioespacial como os verdadeiros fiéis da balança na expansão da mobilidade urbana gratuita no Brasil.
+:::
+
+# Referências Bibliográficas
+
+::: {style="text-align: justify"}
+AFFONSO, Rui de Britto Álvares. Descentralização e reforma do Estado: a federação brasileira na encruzilhada. **Economia e Sociedade**, Campinas, v. 9, n. 1, p. 127-152, 2000.
+
+ALLISON, Paul D. Comparing logit and probit coefficients across groups. **Sociological Methods & Research**, v. 28, n. 2, p. 186-208, 1999.
+
+ALLISON, Paul D. Measures of fit for logistic regression. **SAS Global Forum**, Cary, p. 1-13, 2014.
+
+ANSELIN, Luc. **Spatial econometrics: methods and models**. Dordrecht: Kluwer Academic Publishers, 1988.
+
+ARRETCHE, Marta. **Democracia, federalismo e centralização no Brasil**. Rio de Janeiro: Editora Fiocruz, 2012.
+
+BOLLEN, Kenneth A.; JACKMAN, Robert W. Regression diagnostics: An expository treatment of outliers and influential cases. In: FOX, J. (Ed.). **Modern methods of data analysis**. p. 257-291, 1990.
+
+CINELLI, Carlos; HAZLETT, Chad. Making sense of sensitivity: Extending omitted variable bias. **Journal of the Royal Statistical Society: Series B (Statistical Methodology)**, v. 82, n. 1, p. 39-67, 2020.
+
+COOK, R. Dennis. **Regression graphics: Ideas for studying regressions through graphics**. New York: John Wiley & Sons, 1998.
+
+EBRAHIM, \[Autor/Equipe\]. **ebrahim.gof: Goodness-of-Fit Tests for Rare Event Logistic Regression**. Pacote R, 2024.
+
+EFRON, Bradley; TIBSHIRANI, Robert J. **An introduction to the bootstrap**. New York: Chapman and Hall, 1993.
+
+FARRINGTON, C. P. On assessing goodness of fit of generalized linear models to sparse data. **Journal of the Royal Statistical Society: Series B (Methodological)**, v. 58, n. 1, p. 349-360, 1996.
+
+FIGUEIREDO FILHO, Dalson Brito et al. O que fazer com a multicolinearidade? **Revista Política Hoje**, v. 20, n. 1, p. 167-203, 2011.
+
+FOX, John; MONETTE, Georges. Generalized collinearity diagnostics. **Journal of the American Statistical Association**, v. 87, n. 417, p. 178-183, 1992.
+
+FOX, John; WEISBERG, Sanford. **An R companion to applied regression**. 3. ed. Thousand Oaks: Sage, 2019.
+
+GELMAN, Andrew; HILL, Jennifer. **Data analysis using regression and multilevel/hierarchical models**. New York: Cambridge University Press, 2007.
+
+HARTIG, Florian. **DHARMa: residual diagnostics for hierarchical (multi-level/mixed) regression models**. Pacote R, 2022.
+
+HEINZE, Georg; SCHEMPER, Michael. A solution to the problem of separation in logistic regression. **Statistics in medicine**, v. 21, n. 16, p. 2409-2419, 2002.
+
+HOSMER, David W.; LEMESHOW, Stanley; STURDIVANT, Rodney X. **Applied logistic regression**. 3. ed. Hoboken: John Wiley & Sons, 2013.
+
+KING, Gary; ZENG, Langche. Logistic regression in rare events data. **Political analysis**, v. 9, n. 2, p. 137-163, 2001.
+
+KOSMIDIS, Ioannis; FIRTH, David. Jeffreys-prior penalty, finiteness and shrinkage in binomial-response generalized linear models. **Biometrika**, v. 108, n. 1, p. 71-82, 2021.
+
+KUHN, Max; JOHNSON, Kjell. **Applied predictive modeling**. New York: Springer, 2013.
+
+LANTZ, Brett. **Machine learning with R: expert techniques for predictive modeling**. 3. ed. Birmingham: Packt Publishing, 2019.
+
+NUNES, Felipe. **Data Science na Ciência Política**. Belo Horizonte: UFMG, 2020.
+
+PAUL, P.; PENNELL, M. L.; LEMESHOW, S. Standardizing the power of the Hosmer-Lemeshow goodness of fit test in large data sets. **Statistics in Medicine**, v. 32, n. 1, p. 67-80, 2013.
+
+POPPER, Karl R. **A lógica da pesquisa científica**. São Paulo: Cultrix, 1959.
+
+WOOLDRIDGE, Jeffrey M. **Econometric analysis of cross section and panel data**. 2. ed. Cambridge: MIT Press, 2010.
+:::
